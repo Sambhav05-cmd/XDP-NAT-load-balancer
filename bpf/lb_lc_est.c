@@ -8,7 +8,7 @@
 #define ETH_ALEN 6
 #define AF_INET 2
 #define IPROTO_TCP 6
-#define MAX_TCP_CHECK_WORDS 100
+#define MAX_TCP_CHECK_WORDS 750
 
 // every backend's ip, port, and number of active connections
 struct backend

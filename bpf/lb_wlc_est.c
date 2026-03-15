@@ -8,7 +8,7 @@
 #define ETH_ALEN 6
 #define AF_INET 2
 #define IPROTO_TCP 6
-#define MAX_TCP_CHECK_WORDS 100
+#define MAX_TCP_CHECK_WORDS 750
 
 // every backend's ip and number of active connections
 
@@ -182,7 +182,6 @@ static __always_inline __u16 recalc_tcp_checksum(struct tcphdr *tcph, struct iph
   // Use a safe bound check against data_end for the pointer,
   // but the loop limit should be based on the actual packet size
   __u16 *ptr = (__u16 *)tcph;
-#pragma unroll
   for (int i = 0; i < MAX_TCP_CHECK_WORDS; i++)
   {
     if ((void *)(ptr + 1) > data_end || (void *)ptr >= (void *)tcph + tcp_len)

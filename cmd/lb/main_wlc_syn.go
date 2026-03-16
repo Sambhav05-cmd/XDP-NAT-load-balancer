@@ -40,12 +40,6 @@ type Config struct {
 	Backends []BackendConfig `json:"backends"`
 }
 
-type lb4Service struct {
-	Vip  uint32
-	Port uint16
-	Pad  uint16
-}
-
 func parseIPv4(s string) (uint32, error) {
 	ip := net.ParseIP(s).To4()
 	if ip == nil {

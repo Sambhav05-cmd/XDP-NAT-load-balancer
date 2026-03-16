@@ -423,7 +423,6 @@ int xdp_load_balancer(struct xdp_md *ctx)
       }
       // bpf_printk("yessss");
 
-      __u32 key = 0;
       __u32 min_conn = (__u32)-1;
 
       __u32 zero = 0;
@@ -431,7 +430,7 @@ int xdp_load_balancer(struct xdp_md *ctx)
       if (!num_backends)
         return XDP_ABORTED;
 
-      __u32 best_key = 0;
+      __u32 key = 0;
       __u32 best_conns = 0;
       __u32 best_weight = 0;
       __u8 found = 0;
@@ -449,7 +448,7 @@ int xdp_load_balancer(struct xdp_md *ctx)
         if (!found)
         {
           // First valid backend — take it unconditionally
-          best_key = k;
+          key = k;
           best_conns = candidate->conns;
           best_weight = candidate->weight;
           found = 1;
@@ -461,7 +460,7 @@ int xdp_load_balancer(struct xdp_md *ctx)
         //   candidate->conns * best_weight  <  best_conns * candidate->weight
         if (candidate->conns * best_weight < best_conns * candidate->weight)
         {
-          best_key = k;
+          key = k;
           best_conns = candidate->conns;
           best_weight = candidate->weight;
         }
@@ -469,8 +468,6 @@ int xdp_load_balancer(struct xdp_md *ctx)
 
       if (!found)
         return XDP_ABORTED;
-
-      __u32 key = best_key;
 
       b = bpf_map_lookup_elem(&backends, &key);
       if (!b)

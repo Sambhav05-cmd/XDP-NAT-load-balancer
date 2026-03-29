@@ -24,8 +24,8 @@ struct backend
 {
   __u32 ip;
   __u16 port;
-  __u32 conns;
   __u16 weight;
+  __u32 conns;
 };
 
 // Connection state lives ONLY here (conntrack map).
@@ -37,23 +37,30 @@ struct backend
 //   4 = Both sides have FIN'd → delete on next ACK
 struct conn_meta
 {
-  __u32 ip;          // client IP (used for backend traffic to rewrite back to client IP)
-  __u16 port;        // client port (used for backend traffic to rewrite back to client port)
-  __u32 backend_idx; // used for backend traffic to index into backends map
+  __u32 ip;         // client IP (used for backend traffic to rewrite back to client IP)
+  __u16 port;       // client port (used for backend traffic to rewrite back to client port)
+  __u32 backend_id; // used for backend traffic to index into backends map
   __u8 state;
   __u16 service_port;
 };
 
-// Backend IPs
-// We could also include port information but we simplify
-// and assume that both LB and Backend listen on the same port for requests
+// store all backends in hash map, key is unique backend id, value is backend struct
+struct
+{
+  __uint(type, BPF_MAP_TYPE_HASH);
+  __uint(max_entries, MAX_BACKENDS);
+  __type(key, __u32);
+  __type(value, struct backend);
+} backends SEC(".maps");
+
+// store IDs of map in an array to iterate over the hash map
 struct
 {
   __uint(type, BPF_MAP_TYPE_ARRAY);
   __uint(max_entries, MAX_BACKENDS);
   __type(key, __u32);
-  __type(value, struct backend);
-} backends SEC(".maps");
+  __type(value, __u32);
+} selection_array SEC(".maps");
 
 struct
 {
@@ -329,13 +336,13 @@ int xdp_load_balancer(struct xdp_md *ctx)
     if ((tcp->ack && ct->state == 4 && tcp->fin == 0) || tcp->rst)
     {
       // Decrement backend connection counter
-      struct backend *b = bpf_map_lookup_elem(&backends, &ct->backend_idx);
+      struct backend *b = bpf_map_lookup_elem(&backends, &ct->backend_id);
       if (!b)
         return XDP_ABORTED;
       struct backend nb = *b;
       if (nb.conns > 0)
         nb.conns -= 1;
-      bpf_map_update_elem(&backends, &ct->backend_idx, &nb, BPF_ANY);
+      bpf_map_update_elem(&backends, &ct->backend_id, &nb, BPF_ANY);
 
       // add port back to free pool
       __u16 p = bpf_ntohs(ct_key_from_backend.port);
@@ -390,6 +397,7 @@ int xdp_load_balancer(struct xdp_md *ctx)
     po_key.ip = ip->saddr;
     struct ip_port *ct_key_pointer = bpf_map_lookup_elem(&port_ownership, &po_key);
 
+    __u32 *backend_id;
     struct backend *b;
     struct ip_port ct_key = {};
 
@@ -422,14 +430,17 @@ int xdp_load_balancer(struct xdp_md *ctx)
           break;
 
         __u32 k = i;
-        struct backend *candidate = bpf_map_lookup_elem(&backends, &k);
+        __u32 *backend_id = bpf_map_lookup_elem(&selection_array, &k);
+        if (!backend_id)
+          continue;
+        struct backend *candidate = bpf_map_lookup_elem(&backends, backend_id);
         if (!candidate || candidate->weight == 0)
           continue;
 
         if (!found)
         {
           // First valid backend — take it unconditionally
-          key = k;
+          key = *backend_id;
           best_conns = candidate->conns;
           best_weight = candidate->weight;
           found = 1;
@@ -441,7 +452,7 @@ int xdp_load_balancer(struct xdp_md *ctx)
         //   candidate->conns * best_weight  <  best_conns * candidate->weight
         if (candidate->conns * best_weight < best_conns * candidate->weight)
         {
-          key = k;
+          key = *backend_id;
           best_conns = candidate->conns;
           best_weight = candidate->weight;
         }
@@ -449,7 +460,6 @@ int xdp_load_balancer(struct xdp_md *ctx)
 
       if (!found)
         return XDP_ABORTED;
-      found = false;
 
       b = bpf_map_lookup_elem(&backends, &key);
       if (!b)
@@ -473,7 +483,7 @@ int xdp_load_balancer(struct xdp_md *ctx)
 
       struct conn_meta meta = {};
       meta.ip = ip->saddr;
-      meta.backend_idx = key;
+      meta.backend_id = key;
       meta.state = 0;
       meta.port = tcp->source; // store original client source port for reply direction
       meta.service_port = svc_key.port;
@@ -500,7 +510,7 @@ int xdp_load_balancer(struct xdp_md *ctx)
       if (!ct)
         return XDP_ABORTED;
       ct_port = ct_key.port;
-      b = bpf_map_lookup_elem(&backends, &ct->backend_idx);
+      b = bpf_map_lookup_elem(&backends, &ct->backend_id);
       if (!b)
         return XDP_ABORTED;
       //  If state is 0 and first non-SYN packet , meaning connection established
@@ -514,7 +524,7 @@ int xdp_load_balancer(struct xdp_md *ctx)
         // Increment connection counter for the backend
         struct backend nb = *b;
         nb.conns += 1;
-        bpf_map_update_elem(&backends, &ct->backend_idx, &nb, BPF_ANY);
+        bpf_map_update_elem(&backends, &ct->backend_id, &nb, BPF_ANY);
         bpf_printk("conn established : Backend %pI4 conns=%d",
                    &b->ip, nb.conns);
         ct = bpf_map_lookup_elem(&conntrack, &ct_key);
@@ -551,7 +561,7 @@ int xdp_load_balancer(struct xdp_md *ctx)
         // decrement backend connection counter
         if (nb.conns > 0)
           nb.conns -= 1;
-        bpf_map_update_elem(&backends, &ct->backend_idx, &nb, BPF_ANY);
+        bpf_map_update_elem(&backends, &ct->backend_id, &nb, BPF_ANY);
         // delete conntrack and port_ownership entries
         bpf_map_delete_elem(&conntrack, &ct_key);
         bpf_map_delete_elem(&port_ownership, &po_key);

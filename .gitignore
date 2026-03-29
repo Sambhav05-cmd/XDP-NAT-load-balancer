@@ -1,6 +1,15 @@
-/bin
-*.out
-lb_lc_*
-lb_lwc_*
-lb_wlc_*
-cmd/lb/lb*_bpf.go
+# Generated eBPF Go bindings
+*_bpf.go
+
+# Generated protobuf files
+*.pb.go
+*_grpc.pb.go
+
+# Compiled eBPF objects
+*.o
+
+# Binaries
+bin/
+lbxdpd
+lbxdpd-*
+lbctl

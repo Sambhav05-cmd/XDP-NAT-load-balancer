@@ -16,8 +16,8 @@ import (
 )
 
 const (
-	pinDir  = "/sys/fs/bpf/lbxdp"
-	wlcSock = "/var/run/lbxdp-wlc.sock"
+	pinDir   = "/sys/fs/bpf/lbxdp"
+	daemonSock = "/var/run/lbxdpd.sock"
 )
 
 func main() {
@@ -40,7 +40,7 @@ func usage() {
 	fmt.Fprintln(os.Stderr, `lbctl — XDP load balancer control
 
 Backend commands (pinned map access, works with lc and wlc):
-  lbctl add    <ip> <port> [weight]   add backend (weight ignored in lc mode)
+  lbctl add    <ip> <port> [weight]   add backend (weight ignored in lc algo)
   lbctl del    <ip> <port>            remove backend (refused if active conns > 0)
   lbctl list                          list backends with connection counts
 
@@ -49,7 +49,7 @@ Service commands (pinned map access, works with lc and wlc):
   lbctl delsvc  <vip> <port>          deregister a virtual IP
   lbctl listsvc                       list registered VIPs
 
-Weight command (gRPC, wlc daemon only):
+Weight command (gRPC, wlc algo only):
   lbctl weight <ip> <port> <weight>   update a backend's weight live`)
 }
 
@@ -63,7 +63,7 @@ func runGRPCCmd() {
 	port   := mustPort(os.Args[3])
 	weight := mustUint16(os.Args[4], "weight")
 
-	conn, err := grpc.NewClient("unix://"+wlcSock,
+	conn, err := grpc.NewClient("unix://"+daemonSock,
 		grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
 		fatalf("connect to wlc daemon: %v", err)
@@ -85,30 +85,27 @@ func runGRPCCmd() {
 // ── pinned map path (backends + services) ────────────────────────────────────
 
 // lcBackend matches lbBackend/lb2Backend — no Weight field.
-// Padding field keeps Go struct layout aligned with C struct.
 type lcBackend struct {
 	Ip    uint32
 	Port  uint16
-	Pad  uint16 // matches C struct padding; remove if your C struct has no padding
+	Pad   uint16
 	Conns uint32
 }
 
 // wlcBackend matches lb3Backend/lb4Backend — has Weight field.
+// Layout must match the C struct exactly.
 type wlcBackend struct {
-    Ip     uint32
-    Port   uint16
-    Pad1   uint16
-    Conns  uint32
-    Weight uint16
-    Pad2   uint16
+	Ip     uint32
+	Port   uint16
+	Weight uint16
+	Conns  uint32
 }
 
 // serviceKey matches lbIpPort/lb2IpPort/lb3IpPort/lb4IpPort.
-// All four variants have the same layout.
 type serviceKey struct {
 	Ip   uint32
 	Port uint16
-	Pad  uint16 // matches C struct padding; remove if your C struct has no padding
+	Pad  uint16
 }
 
 func runMapMode() {
@@ -132,6 +129,22 @@ func runMapMode() {
 	}
 	defer servicesMap.Close()
 
+	// selection_array and next_id are only present in wlc mode.
+	var selectionMap, nextIDMap *ebpf.Map
+	if mode == "wlc" {
+		selectionMap, err = ebpf.LoadPinnedMap(pinDir+"/selection_array", nil)
+		if err != nil {
+			fatalf("open selection_array map: %v", err)
+		}
+		defer selectionMap.Close()
+
+		nextIDMap, err = ebpf.LoadPinnedMap(pinDir+"/next_id", nil)
+		if err != nil {
+			fatalf("open next_id map: %v", err)
+		}
+		defer nextIDMap.Close()
+	}
+
 	switch os.Args[1] {
 
 	// ── backend commands ──────────────────────────────────────────────────────
@@ -146,7 +159,7 @@ func runMapMode() {
 		if len(os.Args) >= 5 {
 			weight = mustUint16(os.Args[4], "weight")
 		}
-		addBackend(backendsMap, countMap, ip, port, weight, mode)
+		addBackend(backendsMap, countMap, selectionMap, nextIDMap, ip, port, weight, mode)
 
 	case "del":
 		if len(os.Args) < 4 {
@@ -154,10 +167,10 @@ func runMapMode() {
 		}
 		ip   := parseIPv4(os.Args[2])
 		port := mustPort(os.Args[3])
-		delBackend(backendsMap, countMap, ip, port, mode)
+		delBackend(backendsMap, countMap, selectionMap, ip, port, mode)
 
 	case "list":
-		listBackends(backendsMap, countMap, mode)
+		listBackends(backendsMap, countMap, selectionMap, mode)
 
 	// ── service commands ──────────────────────────────────────────────────────
 
@@ -207,7 +220,7 @@ func runMapMode() {
 // readMode reads the sentinel written by the daemon at startup.
 // Returns "lc" or "wlc". Defaults to "lc" if the file is missing.
 func readMode() string {
-    data, err := os.ReadFile("/run/lbxdp.mode")
+	data, err := os.ReadFile("/run/lbxdp.mode")
 	if err != nil {
 		return "lc"
 	}
@@ -216,25 +229,49 @@ func readMode() string {
 
 // ── backend operations ────────────────────────────────────────────────────────
 
-func addBackend(m, countMap *ebpf.Map, ip uint32, port, weight uint16, mode string) {
+func addBackend(backendsMap, countMap, selectionMap, nextIDMap *ebpf.Map,
+	ip uint32, port, weight uint16, mode string) {
+
 	var count uint32
 	if err := countMap.Lookup(uint32(0), &count); err != nil {
 		fatalf("lookup count: %v", err)
 	}
-	if findBackend(m, count, ip, port, mode) >= 0 {
-		fatalf("backend %s:%d already exists", ipToStr(ip), ntohs(port))
-	}
-	var err error
+
 	if mode == "wlc" {
-		be := wlcBackend{Ip: ip, Port: ntohs(port), Weight: weight, Conns: 0}
-		err = m.Update(count, &be, ebpf.UpdateAny)
+		// Duplicate check: walk selection_array, look up each ID in backends hash.
+		if wlcFindPos(backendsMap, selectionMap, count, ip, port) >= 0 {
+			fatalf("backend %s:%d already exists", ipToStr(ip), ntohs(port))
+		}
+		// Allocate next stable ID from pinned next_id map.
+		var nextID uint32
+		if err := nextIDMap.Lookup(uint32(0), &nextID); err != nil {
+			fatalf("lookup next_id: %v", err)
+		}
+		id := nextID
+		nextID++
+		if err := nextIDMap.Update(uint32(0), &nextID, ebpf.UpdateExist); err != nil {
+			fatalf("update next_id: %v", err)
+		}
+		// Insert into backends hash map keyed by stable ID.
+		be := wlcBackend{Ip: ip, Port: htons(port), Weight: weight, Conns: 0}
+		if err := backendsMap.Update(&id, &be, ebpf.UpdateAny); err != nil {
+			fatalf("insert backend: %v", err)
+		}
+		// Append new ID into selection_array at position count.
+		if err := selectionMap.Update(count, &id, ebpf.UpdateAny); err != nil {
+			fatalf("update selection_array: %v", err)
+		}
 	} else {
-		be := lcBackend{Ip: ip, Port: ntohs(port), Conns: 0}
-		err = m.Update(count, &be, ebpf.UpdateAny)
+		// lc mode: backends is still an array map keyed by position.
+		if lcFindPos(backendsMap, count, ip, port) >= 0 {
+			fatalf("backend %s:%d already exists", ipToStr(ip), ntohs(port))
+		}
+		be := lcBackend{Ip: ip, Port: htons(port), Conns: 0}
+		if err := backendsMap.Update(count, &be, ebpf.UpdateAny); err != nil {
+			fatalf("insert backend: %v", err)
+		}
 	}
-	if err != nil {
-		fatalf("insert backend: %v", err)
-	}
+
 	count++
 	if err := countMap.Update(uint32(0), &count, ebpf.UpdateExist); err != nil {
 		fatalf("update count: %v", err)
@@ -242,59 +279,89 @@ func addBackend(m, countMap *ebpf.Map, ip uint32, port, weight uint16, mode stri
 	fmt.Printf("backend added: %s:%d\n", ipToStr(ip), ntohs(port))
 }
 
-func delBackend(m, countMap *ebpf.Map, ip uint32, port uint16, mode string) {
-    var count uint32
-    if err := countMap.Lookup(uint32(0), &count); err != nil {
-        fatalf("lookup count: %v", err)
-    }
-    idx := findBackend(m, count, ip, port, mode)
-    if idx < 0 {
-        fatalf("backend %s:%d not found", ipToStr(ip), ntohs(port))
-    }
-    if conns := getConns(m, uint32(idx), mode); conns != 0 {
-        fatalf("backend has %d active connections — refusing delete", conns)
-    }
-    last := count - 1
-    if uint32(idx) != last {
-        // Swap last entry into the deleted slot.
-        if mode == "wlc" {
-            var b wlcBackend
-            if err := m.Lookup(last, &b); err != nil {
-                fatalf("lookup last: %v", err)
-            }
-            if err := m.Update(uint32(idx), &b, ebpf.UpdateExist); err != nil {
-                fatalf("swap: %v", err)
-            }
-        } else {
-            var b lcBackend
-            if err := m.Lookup(last, &b); err != nil {
-                fatalf("lookup last: %v", err)
-            }
-            if err := m.Update(uint32(idx), &b, ebpf.UpdateExist); err != nil {
-                fatalf("swap: %v", err)
-            }
-        }
-    }
-    // Zero out the last slot — array maps don't support Delete.
-    if mode == "wlc" {
-        zero := wlcBackend{}
-        if err := m.Update(last, &zero, ebpf.UpdateExist); err != nil {
-            fatalf("zero last slot: %v", err)
-        }
-    } else {
-        zero := lcBackend{}
-        if err := m.Update(last, &zero, ebpf.UpdateExist); err != nil {
-            fatalf("zero last slot: %v", err)
-        }
-    }
-    count--
-    if err := countMap.Update(uint32(0), &count, ebpf.UpdateExist); err != nil {
-        fatalf("update count: %v", err)
-    }
-    fmt.Printf("backend deleted: %s:%d\n", ipToStr(ip), ntohs(port))
+func delBackend(backendsMap, countMap, selectionMap *ebpf.Map,
+	ip uint32, port uint16, mode string) {
+
+	var count uint32
+	if err := countMap.Lookup(uint32(0), &count); err != nil {
+		fatalf("lookup count: %v", err)
+	}
+
+	if mode == "wlc" {
+		pos := wlcFindPos(backendsMap, selectionMap, count, ip, port)
+		if pos < 0 {
+			fatalf("backend %s:%d not found", ipToStr(ip), ntohs(port))
+		}
+		// Read the stable ID sitting at this position.
+		var id uint32
+		if err := selectionMap.Lookup(uint32(pos), &id); err != nil {
+			fatalf("lookup id at pos %d: %v", pos, err)
+		}
+		// Refuse if active connections remain.
+		var b wlcBackend
+		if err := backendsMap.Lookup(&id, &b); err != nil {
+			fatalf("lookup backend: %v", err)
+		}
+		if b.Conns != 0 {
+			fatalf("backend has %d active connections — refusing delete", b.Conns)
+		}
+		last := count - 1
+		if uint32(pos) != last {
+			// Swap the last ID in selection_array into the deleted position.
+			var lastID uint32
+			if err := selectionMap.Lookup(last, &lastID); err != nil {
+				fatalf("lookup last id: %v", err)
+			}
+			if err := selectionMap.Update(uint32(pos), &lastID, ebpf.UpdateExist); err != nil {
+				fatalf("swap selection_array: %v", err)
+			}
+		}
+		// Zero the last slot — selection_array is an array map, no Delete.
+		zero := uint32(0)
+		if err := selectionMap.Update(last, &zero, ebpf.UpdateExist); err != nil {
+			fatalf("zero selection_array last slot: %v", err)
+		}
+		// Delete from backends hash map by stable ID — real delete.
+		if err := backendsMap.Delete(&id); err != nil {
+			fatalf("delete backend: %v", err)
+		}
+	} else {
+		// lc mode: plain array swap, same as original.
+		idx := lcFindPos(backendsMap, count, ip, port)
+		if idx < 0 {
+			fatalf("backend %s:%d not found", ipToStr(ip), ntohs(port))
+		}
+		var cur lcBackend
+		if err := backendsMap.Lookup(uint32(idx), &cur); err != nil {
+			fatalf("lookup backend: %v", err)
+		}
+		if cur.Conns != 0 {
+			fatalf("backend has %d active connections — refusing delete", cur.Conns)
+		}
+		last := count - 1
+		if uint32(idx) != last {
+			var lb lcBackend
+			if err := backendsMap.Lookup(last, &lb); err != nil {
+				fatalf("lookup last: %v", err)
+			}
+			if err := backendsMap.Update(uint32(idx), &lb, ebpf.UpdateExist); err != nil {
+				fatalf("swap: %v", err)
+			}
+		}
+		zero := lcBackend{}
+		if err := backendsMap.Update(last, &zero, ebpf.UpdateExist); err != nil {
+			fatalf("zero last slot: %v", err)
+		}
+	}
+
+	count--
+	if err := countMap.Update(uint32(0), &count, ebpf.UpdateExist); err != nil {
+		fatalf("update count: %v", err)
+	}
+	fmt.Printf("backend deleted: %s:%d\n", ipToStr(ip), ntohs(port))
 }
 
-func listBackends(m, countMap *ebpf.Map, mode string) {
+func listBackends(backendsMap, countMap, selectionMap *ebpf.Map, mode string) {
 	var count uint32
 	if err := countMap.Lookup(uint32(0), &count); err != nil {
 		fatalf("lookup count: %v", err)
@@ -303,17 +370,26 @@ func listBackends(m, countMap *ebpf.Map, mode string) {
 		fmt.Println("no backends registered")
 		return
 	}
-	for i := uint32(0); i < count; i++ {
-		if mode == "wlc" {
+	if mode == "wlc" {
+		// Walk selection_array[0..count), get stable ID at each position,
+		// look up the backend struct from the hash map by that ID.
+		for i := uint32(0); i < count; i++ {
+			var id uint32
+			if err := selectionMap.Lookup(i, &id); err != nil {
+				fatalf("selection_array lookup pos %d: %v", i, err)
+			}
 			var b wlcBackend
-			if err := m.Lookup(i, &b); err != nil {
-				continue
+			if err := backendsMap.Lookup(&id, &b); err != nil {
+				fatalf("backends lookup id %d: %v", id, err)
 			}
 			fmt.Printf("%d: %s:%d  weight=%d  conns=%d\n",
-				i, ipToStr(b.Ip), ntohs(b.Port), b.Weight, b.Conns)
-		} else {
+				id, ipToStr(b.Ip), ntohs(b.Port), b.Weight, b.Conns)
+		}
+	} else {
+		// lc mode: backends is a plain array map, index directly.
+		for i := uint32(0); i < count; i++ {
 			var b lcBackend
-			if err := m.Lookup(i, &b); err != nil {
+			if err := backendsMap.Lookup(i, &b); err != nil {
 				continue
 			}
 			fmt.Printf("%d: %s:%d  conns=%d\n",
@@ -322,38 +398,39 @@ func listBackends(m, countMap *ebpf.Map, mode string) {
 	}
 }
 
-func findBackend(m *ebpf.Map, count uint32, ip uint32, port uint16, mode string) int {
+// wlcFindPos walks selection_array[0..count) and returns the position whose
+// stable ID maps to the backend with the given ip:port, or -1 if not found.
+func wlcFindPos(backendsMap, selectionMap *ebpf.Map, count uint32,
+	ip uint32, port uint16) int {
+
 	for i := uint32(0); i < count; i++ {
-		if mode == "wlc" {
-			var b wlcBackend
-			if err := m.Lookup(i, &b); err != nil {
-				continue
-			}
-			if b.Ip == ip && b.Port == htons(port) {
-				return int(i)
-			}
-		} else {
-			var b lcBackend
-			if err := m.Lookup(i, &b); err != nil {
-				continue
-			}
-			if b.Ip == ip && b.Port == htons(port) {
-				return int(i)
-			}
+		var id uint32
+		if err := selectionMap.Lookup(i, &id); err != nil {
+			continue
+		}
+		var b wlcBackend
+		if err := backendsMap.Lookup(&id, &b); err != nil {
+			continue
+		}
+		if b.Ip == ip && b.Port == htons(port) {
+			return int(i)
 		}
 	}
 	return -1
 }
 
-func getConns(m *ebpf.Map, idx uint32, mode string) uint32 {
-	if mode == "wlc" {
-		var b wlcBackend
-		m.Lookup(idx, &b)
-		return b.Conns
+// lcFindPos is the original linear scan for lc mode (array map, keyed by pos).
+func lcFindPos(backendsMap *ebpf.Map, count uint32, ip uint32, port uint16) int {
+	for i := uint32(0); i < count; i++ {
+		var b lcBackend
+		if err := backendsMap.Lookup(i, &b); err != nil {
+			continue
+		}
+		if b.Ip == ip && b.Port == htons(port) {
+			return int(i)
+		}
 	}
-	var b lcBackend
-	m.Lookup(idx, &b)
-	return b.Conns
+	return -1
 }
 
 // ── net / parse helpers ───────────────────────────────────────────────────────

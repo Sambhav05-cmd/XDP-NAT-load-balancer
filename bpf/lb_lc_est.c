@@ -43,9 +43,6 @@ struct conn_meta
   __u16 service_port;
 };
 
-// Backend IPs
-// We could also include port information but we simplify
-// and assume that both LB and Backend listen on the same port for requests
 struct
 {
   __uint(type, BPF_MAP_TYPE_ARRAY);

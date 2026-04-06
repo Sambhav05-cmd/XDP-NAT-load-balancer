@@ -1,10 +1,10 @@
-# XDP Least-Connections NAT Load Balancer
+# XDP Layer-4 NAT Load Balancer
 
 A high-performance Layer-4 NAT based load balancer built in the XDP/eBPF fast path, providing stateful connection-aware scheduling with full NAT semantics.
 
 The dataplane performs connection tracking, backend selection, and bidirectional address rewriting entirely before packets enter the Linux networking stack, enabling low-latency and high-throughput load distribution under heavy connection concurrency.
 
-The system supports both Least-Connections (LC) and Weighted Least-Connections (WLC) scheduling, each available with selectable connection accounting modes. It is structured as a long-running daemon that loads and owns the BPF program, and a separate control CLI that communicates with the daemon at runtime — without ever restarting the dataplane.
+The system supports Least-Connections (LC), Weighted Least-Connections (WLC), Round-Robin (RR), and Weighted Round-Robin (WRR) scheduling, each available with selectable connection accounting modes. It is structured as a long-running daemon that loads and owns the BPF program, and a separate control CLI that communicates with the daemon at runtime — without ever restarting the dataplane.
 
 Traffic is steered only for configured services, allowing unrelated network flows to pass through the interface unaffected.
 
@@ -15,9 +15,9 @@ Traffic is steered only for configured services, allowing unrelated network flow
 ## Table of Contents
 
 - [Overview](#overview)
-- [Key capabilities](#Key-capabilities)
-- [Why least connections instead of hashing](#Why-Least-Connections-instead-of-Hash-Based-Load-Balancing)
-- [Suitable Deployment Scenarios](#Suitable-Deployment-Scenarios)
+- [Key Capabilities](#key-capabilities)
+- [Scheduling Algorithm Comparison](#scheduling-algorithm-comparison)
+- [Suitable Deployment Scenarios](#suitable-deployment-scenarios)
 - [Scheduling Algorithms](#scheduling-algorithms)
 - [Connection Tracking Modes](#connection-tracking-modes)
 - [Repository Structure](#repository-structure)
@@ -40,9 +40,9 @@ Incoming TCP flows destined for configured virtual service endpoints (VIP–port
 Unlike stateless hashing-based dataplane designs, the load balancer maintains per-connection state directly inside eBPF maps, enabling real-time backend selection based on active connection counts and configurable backend weights.
 Both forward and reverse packet paths are rewritten entirely in the XDP layer, providing complete NAT semantics including source-port translation, symmetric return routing, and deterministic connection teardown handling.
 
-The system is split into three components:
+The system is split into two components:
 
-- **`lbxdpd-lc` / `lbxdpd-wlc`** — long-running daemons that load the BPF program, attach it to the network interface, initialise backend state from a config file, and pin the BPF maps to the filesystem so external tools can reach them. The WLC daemon additionally exposes a gRPC control server over a Unix socket for live weight updates.
+- **`lbxdpd`** — a long-running daemon that loads the BPF program, attaches it to the network interface, initialises backend state from a config file, and pins the BPF maps to the filesystem so external tools can reach them. The daemon selects its scheduling algorithm and connection tracking mode at startup via flags. WLC and WRR modes additionally expose a gRPC control server over a Unix socket for live weight updates.
 - **`lbctl`** — a standalone control CLI that reads and writes the pinned BPF maps directly for backend and service operations, and connects to the gRPC socket for weight updates. It requires no daemon restart and works against whichever daemon is currently running.
 
 Because all packet classification, scheduling, connection tracking, and address rewriting occur before socket buffer allocation, the design achieves very low processing latency and high throughput under connection-heavy workloads.
@@ -51,72 +51,87 @@ Because all packet classification, scheduling, connection tracking, and address 
 
 ## Key Capabilities
 
-- Least-Connections and Weighted Least-Connections scheduling
+- Least-Connections, Weighted Least-Connections, Round-Robin, and Weighted Round-Robin scheduling
 - In-datapath TCP connection tracking
 - Full NAT (forward and reverse path rewriting)
 - Multiple virtual services (VIP–port endpoints) with runtime add/remove support
 - Runtime backend addition and removal via `lbctl` without dataplane restart
-- Live weight updates on WLC backends via gRPC, applied instantly without connection disruption
+- Live weight updates on WLC/WRR backends via gRPC, applied instantly without connection disruption
 - Stable traffic distribution under bursty or long-lived connections
 
-Because scheduling decisions are made using real-time connection counts, the load balancer adapts automatically to uneven traffic patterns and backend capacity differences while retaining the performance benefits of early ingress processing with XDP.
-
-The design is suitable for practical high-concurrency environments where stateless hashing leads to load imbalance or poor utilisation fairness.
+Because scheduling decisions are made using real-time connection counts (LC/WLC) or a deterministic rotation (RR/WRR), the load balancer adapts automatically to uneven traffic patterns and backend capacity differences while retaining the performance benefits of early ingress processing with XDP.
 
 ---
 
-## Why Least-Connections instead of Hash Based Load Balancing
+## Scheduling Algorithm Comparison
 
-High-performance L4 load balancers in fast datapaths (including most XDP-based designs) commonly rely on **stateless flow hashing** (e.g., 5-tuple hashing) for backend selection.  
-Hashing offers constant-time scheduling decisions and minimal per-packet overhead, making it attractive for high-throughput environments.
+Hash-based load balancing is common in fast datapaths because it requires no state and makes O(1) decisions. But it has a fundamental problem: **it distributes flows, not load**. When connections have unequal lifetimes or throughput, a hash-balanced backend pool can become heavily skewed. Adjusting weights in a hashing scheme also requires remapping flows, which causes traffic churn and connection disruption.
 
-However, this approach has important practical limitations.
+This project implements four stateful alternatives, each trading a small amount of per-connection overhead for meaningfully better distribution fairness:
 
-- Hashing assumes that traffic load is **evenly distributed across connections**, which is often not true in real deployments.
-- Long-lived or high-throughput persistent connections (such as WebSockets, database sessions, or streaming RPC workloads) can create **significant load imbalance**, even when flow counts appear uniform.
-- Stateless hashing cannot adapt to runtime backend load conditions because flow-to-backend mapping is deterministic for the lifetime of the connection.
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│              Scheduling Algorithm Trade-offs                        │
+├──────────────┬──────────────────────┬──────────────────────────────┤
+│  Algorithm   │   Load Accuracy      │  Overhead / Use Case         │
+├──────────────┼──────────────────────┼──────────────────────────────┤
+│  Hash        │ ✗ Flow-count only    │ Minimal — but unfair under   │
+│              │   Blind to duration  │ skewed or long-lived conns   │
+├──────────────┼──────────────────────┼──────────────────────────────┤
+│  RR          │ ✓ Even rotation      │ Low — great for short-lived  │
+│              │   Ignores live load  │ homogeneous workloads        │
+├──────────────┼──────────────────────┼──────────────────────────────┤
+│  WRR         │ ✓ Weighted rotation  │ Low — proportional for       │
+│              │   Ignores live load  │ heterogeneous capacity       │
+├──────────────┼──────────────────────┼──────────────────────────────┤
+│  LC          │ ✓✓ Live conn count   │ Medium — best fairness for   │
+│              │    Adapts in real    │ persistent/mixed workloads   │
+│              │    time              │                              │
+├──────────────┼──────────────────────┼──────────────────────────────┤
+│  WLC         │ ✓✓ Weighted live     │ Medium — proportional AND    │
+│              │    conn count        │ adaptive; heterogeneous      │
+│              │    Adapts in real    │ backends with mixed load     │
+│              │    time              │                              │
+└──────────────┴──────────────────────┴──────────────────────────────┘
 
-A further challenge arises when **backend capacity changes dynamically**.
+  Hash → always fast, never fair under skew
+  RR/WRR → fast, fair for uniform short-lived connections
+  LC/WLC → slower to decide, genuinely fair under any workload
+```
 
-- Adjusting backend weights in a hashing-based scheduler typically requires **rehashing or remapping flows**, which can lead to:
-  - sudden traffic shifts
-  - connection churn
-  - cache and state disruption on backends
-- Incremental or fine-grained runtime weight updates are therefore difficult to apply without affecting existing traffic distribution.
-
-This project explores **stateful least-connections scheduling implemented directly in the XDP datapath**, enabling adaptive backend selection based on live connection counts and configurable backend weights.
-
-By maintaining lightweight per-connection state in eBPF maps, the load balancer:
-
-- reacts to real-time load imbalance instead of relying on static flow distribution  
-- supports dynamic backend addition, removal, and weight updates without rehashing existing connections  
-- performs scheduling entirely in the fast path without requiring backend-side load reporting  
-
-This design trades modest state-management overhead for **improved utilisation fairness, smoother weight transitions, and better handling of persistent or skewed workloads**, while still benefiting from the high throughput of XDP-based packet processing.
+**In short:**
+- Use **RR** when connections are short-lived and backends are equal — simple, fast, and better than hashing.
+- Use **WRR** when backends have different capacity but connections are short-lived and relatively uniform.
+- Use **LC** when connection lifetimes are uneven or unpredictable — it reacts to real load, not just connection counts.
+- Use **WLC** when backends are heterogeneous in capacity AND connection lifetimes are long or skewed — maximum fairness at the cost of slightly more state.
 
 ---
+
 ## Suitable Deployment Scenarios
-- Backend identity must remain private : Full NAT hides real server IPs and prevents clients from directly addressing backend nodes.
-- Controlled ingress or gateway-style deployments : Centralised entry point simplifies firewalling, policy enforcement, and network segmentation.
-- Persistent or long-lived connection workloads : Better distribution than hash-based scheduling for WebSockets, streaming services, or database sessions.
-- Heterogeneous backend capacity : Weighted least-connections enables proportional load distribution across unequal servers.
 
-High concurrent connection environments
-XDP fast-path processing keeps per-packet overhead low even with stateful scheduling.
+- **Backend identity must remain private** — Full NAT hides real server IPs and prevents clients from directly addressing backend nodes.
+- **Controlled ingress or gateway-style deployments** — Centralised entry point simplifies firewalling, policy enforcement, and network segmentation.
+- **Persistent or long-lived connection workloads** — LC/WLC provide better distribution than hash or RR-based scheduling for WebSockets, streaming services, or database sessions.
+- **Heterogeneous backend capacity** — WLC and WRR enable proportional load distribution across unequal servers.
+- **High concurrent connection environments** — XDP fast-path processing keeps per-packet overhead low even with stateful scheduling.
+- **Short-lived, uniform workloads** — RR and WRR offer a lightweight alternative to hashing with fairer rotation semantics.
+
 ---
 
 ## Scheduling Algorithms
 
 | Algorithm | Description |
 |-----------|-------------|
-| **Least Connections (LC)** | Assigns each new connection to the backend with the fewest active connections. All backends are treated equally. |
-| **Weighted Least Connections (WLC)** | Assigns connections based on `active_connections / weight`. Backends with higher weights receive a proportionally larger share of traffic. |
+| **Least Connections (LC)** | Assigns each new connection to the backend with the fewest active connections. All backends are treated equally. Best for uneven or long-lived workloads. |
+| **Weighted Least Connections (WLC)** | Assigns connections based on `active_connections / weight`. Backends with higher weights receive a proportionally larger share of traffic. Adapts to live load. |
+| **Round Robin (RR)** | Assigns connections to backends in a fixed rotation. All backends receive an equal share over time. Fast and stateless per-decision; ideal for short-lived, uniform connections. |
+| **Weighted Round Robin (WRR)** | Extends RR with per-backend weights, distributing connections proportionally. Backends with higher weights are selected more frequently in the rotation cycle. |
 
 ---
 
 ## Connection Tracking Modes
 
-Both algorithms are available in two builds, differing only in *when* a connection is counted:
+All four algorithms are available in two builds, differing only in *when* a connection is counted:
 
 | Mode | Counts on | Pros | Cons |
 |------|-----------|------|------|
@@ -126,24 +141,24 @@ Both algorithms are available in two builds, differing only in *when* a connecti
 ---
 
 ## Repository Structure
+
 ```
 .
 ├── bin/                        # Built binaries (ignored in git)
-│   ├── lbctl                   # CLI tool
-│   ├── lbxdpd                  # Generic daemon (if used)
-│   ├── lbxdpd-lc               # LC daemon binary
-│   └── lbxdpd-wlc              # WLC daemon binary
+│   └── lbctl                   # CLI tool
+│   └── lbxdpd                  # Unified daemon (all algorithms)
 ├── bpf/                        # eBPF/XDP programs (C source)
 │   ├── lb_lc_est.c             # Least Connections (established-mode)
 │   ├── lb_lc_syn.c             # Least Connections (SYN-mode)
 │   ├── lb_wlc_est.c            # Weighted LC (established-mode)
 │   ├── lb_wlc_syn.c            # Weighted LC (SYN-mode)
+│   ├── lb_rr_est.c             # Round Robin (established-mode)
+│   ├── lb_rr_syn.c             # Round Robin (SYN-mode)
+│   ├── lb_wrr_est.c            # Weighted Round Robin (established-mode)
+│   ├── lb_wrr_syn.c            # Weighted Round Robin (SYN-mode)
 │   ├── parse_helpers.h         # Packet parsing helpers
 │   └── vmlinux.h               # BTF header for CO-RE
 ├── cmd/
-│   ├── lb/                     # Generated eBPF Go bindings (ignored)
-│   │   ├── *_bpf.go
-│   │   └── *_bpf.o
 │   ├── lbctl/                  # CLI — interacts with maps + gRPC
 │   │   ├── main.go
 │   │   └── mapmode.go
@@ -152,8 +167,10 @@ Both algorithms are available in two builds, differing only in *when* a connecti
 │       ├── ports.go
 │       └── variants.go
 ├── configs/
-│   ├── backends_lc.json        # Backend config (LC)
-│   └── backends_wlc.json       # Backend config (WLC with weights)
+│   ├── backends_lc.json        # Backend config (LC / RR — no weights)
+│   ├── backends_wlc.json       # Backend config (WLC with weights)
+│   ├── backends_rr.json        # Backend config (RR — same format as LC)
+│   └── backends_wrr.json       # Backend config (WRR with weights)
 ├── proto/
 │   ├── control.proto           # gRPC service definition
 │   └── *.pb.go                 # Generated protobuf bindings (ignored)
@@ -166,19 +183,19 @@ Both algorithms are available in two builds, differing only in *when* a connecti
 └── README.md
 ```
 
-The system is split into three binaries:
+The system is split into two binaries:
 
 | Binary | Role |
 |--------|------|
-| `lbxdpd-lc` | LC daemon — loads the BPF program, attaches XDP, pins maps, exposes gRPC |
-| `lbxdpd-wlc` | WLC daemon — same as above, adds weight-update support over gRPC |
-| `lbctl` | Control CLI — reads pinned maps directly for backend/service operations; uses gRPC for live weight updates (WLC only) |
+| `lbxdpd` | Unified daemon — selects algorithm and mode at startup via `-algo` and `-mode` flags |
+| `lbctl` | Control CLI — reads pinned maps for backend/service operations; uses gRPC for live weight updates (WLC/WRR only) |
 
 ---
 
 ## Prerequisites
 
 Install LLVM and required toolchain dependencies:
+
 ```bash
 sudo ./scripts/llvm.sh
 ```
@@ -191,7 +208,8 @@ sudo ./scripts/llvm.sh
 
 The load balancer is configured at startup using a JSON file specifying the virtual service endpoint (VIP + port) and the initial backend pool. Backends and services can also be added, removed, or reweighted live via `lbctl` after startup.
 
-### LC — `configs/backends_lc.json`
+### LC / RR — `configs/backends_lc.json` / `configs/backends_rr.json`
+
 ```json
 {
   "service": {
@@ -205,7 +223,8 @@ The load balancer is configured at startup using a JSON file specifying the virt
 }
 ```
 
-### WLC — `configs/backends_wlc.json`
+### WLC / WRR — `configs/backends_wlc.json` / `configs/backends_wrr.json`
+
 ```json
 {
   "service": {
@@ -219,41 +238,68 @@ The load balancer is configured at startup using a JSON file specifying the virt
 }
 ```
 
+> **Note:** The `weight` field is ignored in LC and RR modes. It defaults to `1` if omitted in WLC/WRR modes.
+
 ---
 
 ## Building
+
 ```bash
-./scripts/gen.sh
 ./scripts/build.sh
 ```
 
-This produces three binaries in `bin/`:
+This runs code generation (eBPF bindings + protobuf) and produces two binaries in `bin/`:
 
 | Binary | Description |
 |--------|-------------|
-| `lbxdpd-lc` | LC daemon |
-| `lbxdpd-wlc` | WLC daemon |
+| `lbxdpd` | Unified daemon — handles all four algorithms |
 | `lbctl` | Control CLI |
 
 ---
 
 ## Running
 
-Start the daemon first. It loads the BPF program, attaches it to the interface, and pins the maps so `lbctl` can reach them.
+Start the daemon first. It loads the correct BPF program variant, attaches it to the interface, and pins the maps so `lbctl` can reach them.
 
-**LC:**
-```bash
-sudo ./bin/lbxdpd-lc -i <interface> -mode syn -config configs/backends_lc.json
-sudo ./bin/lbxdpd-lc -i <interface> -mode est -config configs/backends_lc.json
+The daemon is controlled entirely through flags:
+
+```
+-i <interface>     Network interface to attach XDP to (e.g. eth0, ens3)
+-algo <algo>       Scheduling algorithm: lc, wlc, rr, wrr  (default: lc)
+-mode <mode>       Connection tracking mode: est, syn       (default: est)
+-config <path>     Path to backends JSON config
+-sock <path>       gRPC Unix socket path (default: /var/run/lbxdpd.sock)
 ```
 
-**WLC:**
+### Least Connections (LC)
+
 ```bash
-sudo ./bin/lbxdpd-wlc -i <interface> -mode syn -config configs/backends_wlc.json
-sudo ./bin/lbxdpd-wlc -i <interface> -mode est -config configs/backends_wlc.json
+sudo ./bin/lbxdpd -i eth0 -algo lc -mode syn -config configs/backends_lc.json
+sudo ./bin/lbxdpd -i eth0 -algo lc -mode est -config configs/backends_lc.json
 ```
 
-Replace `<interface>` with the interface to attach to (e.g. `eth0`, `wlo1`).
+### Weighted Least Connections (WLC)
+
+```bash
+sudo ./bin/lbxdpd -i eth0 -algo wlc -mode syn -config configs/backends_wlc.json
+sudo ./bin/lbxdpd -i eth0 -algo wlc -mode est -config configs/backends_wlc.json
+```
+
+### Round Robin (RR)
+
+```bash
+sudo ./bin/lbxdpd -i eth0 -algo rr -mode syn -config configs/backends_rr.json
+sudo ./bin/lbxdpd -i eth0 -algo rr -mode est -config configs/backends_rr.json
+```
+
+### Weighted Round Robin (WRR)
+
+```bash
+sudo ./bin/lbxdpd -i eth0 -algo wrr -mode syn -config configs/backends_wrr.json
+sudo ./bin/lbxdpd -i eth0 -algo wrr -mode est -config configs/backends_wrr.json
+```
+
+Replace `eth0` with the interface you want to attach to (e.g. `wlo1`, `ens3`).
 
 The recommended mode is `-mode syn` for bursty workloads. Use `-mode est` for stable, long-lived connection workloads.
 
@@ -263,38 +309,40 @@ Once the daemon is running, use `lbctl` in a separate terminal.
 
 ## Runtime CLI — Structured Reference
 
+`lbctl` determines the running algorithm automatically by reading `/run/lbxdp.mode`, which the daemon writes at startup. No algorithm flag is needed.
+
 ### Backend operations
 
-| Command | Syntax | Mode | Description | Notes |
-|--------|--------|------|-------------|------|
-| Add backend | `sudo ./bin/lbctl add <ip> <port> [weight]` | LC + WLC | Inserts a backend server into the pinned BPF backend map | `weight` ignored in LC mode |
-| Delete backend | `sudo ./bin/lbctl del <ip> <port>` | LC + WLC | Removes backend from map | Refused if active connections > 0 |
-| List backends | `sudo ./bin/lbctl list` | LC + WLC | Displays backend index, IP, port, connection count, and weight (if WLC) | Reads from pinned maps |
+| Command | Syntax | Algorithms | Description | Notes |
+|--------|--------|------------|-------------|-------|
+| Add backend | `sudo ./bin/lbctl add <ip> <port> [weight]` | All | Inserts a backend server into the pinned BPF backend map | `weight` ignored in LC/RR mode |
+| Delete backend | `sudo ./bin/lbctl del <ip> <port>` | All | Removes backend from map | Refused if active connections > 0 |
+| List backends | `sudo ./bin/lbctl list` | All | Displays backend index, IP, port, connection count, and weight (if WLC/WRR) | Reads from pinned maps |
 
 ---
 
 ### Service (VIP) operations
 
-| Command | Syntax | Mode | Description | Notes |
-|--------|--------|------|-------------|------|
-| Add service | `sudo ./bin/lbctl addsvc <vip> <port>` | LC + WLC | Registers a virtual service endpoint (VIP:port) | Stored in services BPF map |
-| Delete service | `sudo ./bin/lbctl delsvc <vip> <port>` | LC + WLC | Deregisters the VIP entry | |
-| List services | `sudo ./bin/lbctl listsvc` | LC + WLC | Lists all configured VIPs | |
+| Command | Syntax | Algorithms | Description | Notes |
+|--------|--------|------------|-------------|-------|
+| Add service | `sudo ./bin/lbctl addsvc <vip> <port>` | All | Registers a virtual service endpoint (VIP:port) | Stored in services BPF map |
+| Delete service | `sudo ./bin/lbctl delsvc <vip> <port>` | All | Deregisters the VIP entry | |
+| List services | `sudo ./bin/lbctl listsvc` | All | Lists all configured VIPs | |
 
 ---
 
 ### Weight control (runtime scheduling update)
 
-| Command | Syntax | Mode | Description | Notes |
-|--------|--------|------|-------------|------|
-| Update backend weight | `sudo ./bin/lbctl weight <ip> <port> <weight>` | WLC only | Sends gRPC request to daemon to update backend scheduling weight | Uses Unix domain socket control channel |
+| Command | Syntax | Algorithms | Description | Notes |
+|--------|--------|------------|-------------|-------|
+| Update backend weight | `sudo ./bin/lbctl weight <ip> <port> <weight>` | WLC, WRR only | Sends gRPC request to daemon to update backend scheduling weight | Uses Unix domain socket control channel |
 
 ---
 
 ### Program attachment verification
 
 | Purpose | Command | Description |
-|--------|--------|-------------|
+|---------|---------|-------------|
 | Verify XDP program attached | `sudo bpftool prog show` | Lists loaded BPF programs and their attach points |
 
 ---
@@ -315,16 +363,19 @@ To test connection tracking, connections need to persist for some time. The `soc
 ### 1. Start backend servers
 
 Run this on each backend machine:
+
 ```bash
 socat TCP-LISTEN:8000,reuseaddr,fork EXEC:/bin/cat
 ```
 
 ### 2. Send a single request
+
 ```bash
 socat - TCP:<load_balancer_ip>:8000
 ```
 
 ### 3. Simulate high concurrency
+
 ```bash
 for i in $(seq 1 100); do
   socat - TCP:<load_balancer_ip>:8000 &
@@ -332,28 +383,32 @@ done
 ```
 
 ### 4. Check active kernel TCP connections
+
 ```bash
 ss -tan '( sport = :8000 )' | wc -l
 ```
 
 ### 5. Observe backend distribution
+
 ```bash
 sudo ./bin/lbctl list
 ```
 
-Under burst load, the SYN variants distribute more evenly than the established variants because counters are incremented immediately on SYN arrival. With WLC, backends with higher weights absorb a proportionally larger share of connections.
+Under burst load, the SYN variants distribute more evenly than the established variants because counters are incremented immediately on SYN arrival. With WLC or WRR, backends with higher weights absorb a proportionally larger share of connections. With RR, you will observe strict rotation across backends regardless of connection lifetime.
 
 ---
 
 ## Customization
 
 The load balancer currently handles a maximum of 60000 simultaneous connections. To change this, modify the constants in the BPF program:
+
 ```c
 #define MAX_CONNECTIONS 60000
 #define MAX_PORT 61024
 ```
 
 And the corresponding value in the daemon's `ports.go`:
+
 ```go
 const maxPort = 61024
 ```

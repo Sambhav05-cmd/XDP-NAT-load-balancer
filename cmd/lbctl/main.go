@@ -95,21 +95,19 @@ type lcBackend struct {
 	Conns uint32
 }
 
-// wlcBackend matches lb3Backend/lb4Backend/lb7Backend/lb8Backend.
-// C layout: ip(4) port(2) pad(2) conns(4) weight(2) pad(2)
-// Port stored RAW (host order) — BPF C does its own byte-order handling.
+// wlcBackend matches lb3Backend/lb4Backend.
+// C layout: ip(4) port(2) weight(2) conns(4)  — 12 bytes, no padding.
+// Port stored as htons.
 type wlcBackend struct {
 	Ip     uint32
 	Port   uint16
-	Pad0   uint16
-	Conns  uint32
 	Weight uint16
-	Pad1   uint16
+	Conns  uint32
 }
 
 // wrrBackend matches lb7Backend/lb8Backend — same as wlcBackend + UsedCount.
 // C layout: ip(4) port(2) pad(2) conns(4) weight(2) pad(2) used_count(4)
-// Port stored RAW (host order).
+// Port stored as htons.
 type wrrBackend struct {
 	Ip        uint32
 	Port      uint16
@@ -238,8 +236,7 @@ func readMode() string {
 // ── backend operations ────────────────────────────────────────────────────────
 //
 // Port convention (mirrors variants.go exactly):
-//   lc / rr  → stored as htons; lbctl writes htons, compares with htons, displays with ntohs
-//   wlc / wrr → stored RAW;    lbctl writes raw,   compares raw,          displays raw
+//   all algos → stored as htons; lbctl writes htons, compares with htons, displays with ntohs
 
 func addBackend(backendsMap, countMap *ebpf.Map, ip uint32, port, weight uint16, mode string) {
 	var count uint32
@@ -252,7 +249,7 @@ func addBackend(backendsMap, countMap *ebpf.Map, ip uint32, port, weight uint16,
 		if wlcFindIdx(backendsMap, count, ip, port) >= 0 {
 			fatalf("backend %s:%d already exists", ipToStr(ip), port)
 		}
-		be := wlcBackend{Ip: ip, Port: port, Conns: 0, Weight: weight}
+		be := wlcBackend{Ip: ip, Port: htons(port), Conns: 0, Weight: weight}
 		if err := backendsMap.Update(count, &be, ebpf.UpdateAny); err != nil {
 			fatalf("insert backend: %v", err)
 		}
@@ -260,7 +257,7 @@ func addBackend(backendsMap, countMap *ebpf.Map, ip uint32, port, weight uint16,
 		if wrrFindIdx(backendsMap, count, ip, port) >= 0 {
 			fatalf("backend %s:%d already exists", ipToStr(ip), port)
 		}
-		be := wrrBackend{Ip: ip, Port: port, Conns: 0, Weight: weight, UsedCount: 0}
+		be := wrrBackend{Ip: ip, Port: htons(port), Conns: 0, Weight: weight, UsedCount: 0}
 		if err := backendsMap.Update(count, &be, ebpf.UpdateAny); err != nil {
 			fatalf("insert backend: %v", err)
 		}
@@ -278,7 +275,7 @@ func addBackend(backendsMap, countMap *ebpf.Map, ip uint32, port, weight uint16,
 	if err := countMap.Update(uint32(0), &count, ebpf.UpdateExist); err != nil {
 		fatalf("update count: %v", err)
 	}
-	fmt.Printf("backend added: %s:%d\n", ipToStr(ip), port)
+	fmt.Printf("backend added: %s:%d\n", ipToStr(ip), ntohs(port))
 }
 
 func delBackend(backendsMap, countMap, conntrackMap *ebpf.Map, ip uint32, port uint16, mode string) {
@@ -384,7 +381,7 @@ func delBackend(backendsMap, countMap, conntrackMap *ebpf.Map, ip uint32, port u
 	if err := countMap.Update(uint32(0), &count, ebpf.UpdateExist); err != nil {
 		fatalf("update count: %v", err)
 	}
-	fmt.Printf("backend deleted: %s:%d\n", ipToStr(ip), port)
+	fmt.Printf("backend deleted: %s:%d\n", ipToStr(ip), ntohs(port))
 }
 
 func listBackends(backendsMap, countMap *ebpf.Map, mode string) {
@@ -403,9 +400,8 @@ func listBackends(backendsMap, countMap *ebpf.Map, mode string) {
 			if err := backendsMap.Lookup(i, &b); err != nil {
 				continue
 			}
-			// Port is RAW for wlc — display directly
 			fmt.Printf("%d: %s:%d  weight=%d  conns=%d\n",
-				i, ipToStr(b.Ip), b.Port, b.Weight, b.Conns)
+				i, ipToStr(b.Ip), ntohs(b.Port), b.Weight, b.Conns)
 		}
 	case "wrr":
 		for i := uint32(0); i < count; i++ {
@@ -413,9 +409,8 @@ func listBackends(backendsMap, countMap *ebpf.Map, mode string) {
 			if err := backendsMap.Lookup(i, &b); err != nil {
 				continue
 			}
-			// Port is RAW for wrr — display directly
 			fmt.Printf("%d: %s:%d  weight=%d  used=%d  conns=%d\n",
-				i, ipToStr(b.Ip), b.Port, b.Weight, b.UsedCount, b.Conns)
+				i, ipToStr(b.Ip), ntohs(b.Port), b.Weight, b.UsedCount, b.Conns)
 		}
 	default: // lc and rr — port stored as htons, must ntohs to display
 		for i := uint32(0); i < count; i++ {
@@ -429,28 +424,28 @@ func listBackends(backendsMap, countMap *ebpf.Map, mode string) {
 	}
 }
 
-// wlcFindIdx: port stored RAW — compare raw vs raw.
+// wlcFindIdx: port stored as htons — compare htons vs htons.
 func wlcFindIdx(backendsMap *ebpf.Map, count uint32, ip uint32, port uint16) int {
 	for i := uint32(0); i < count; i++ {
 		var b wlcBackend
 		if err := backendsMap.Lookup(i, &b); err != nil {
 			continue
 		}
-		if b.Ip == ip && b.Port == port {
+		if b.Ip == ip && b.Port == htons(port) {
 			return int(i)
 		}
 	}
 	return -1
 }
 
-// wrrFindIdx: port stored RAW — compare raw vs raw.
+// wrrFindIdx: port stored as htons — compare htons vs htons.
 func wrrFindIdx(backendsMap *ebpf.Map, count uint32, ip uint32, port uint16) int {
 	for i := uint32(0); i < count; i++ {
 		var b wrrBackend
 		if err := backendsMap.Lookup(i, &b); err != nil {
 			continue
 		}
-		if b.Ip == ip && b.Port == port {
+		if b.Ip == ip && b.Port == htons(port) {
 			return int(i)
 		}
 	}

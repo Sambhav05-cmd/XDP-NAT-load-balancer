@@ -533,8 +533,8 @@ func (v *lcSynVariant) DeleteService(ip string, port uint16) error {
 }
 
 // ── WLC-EST variant (lb3 / lb_wlc_est.c) ─────────────────────────────────────
-// struct backend layout: { ip, port, conns, weight }
-// Port stored RAW (no htons) — BPF C code does its own byte-order handling.
+// struct backend layout: { ip, port, weight, conns }
+// Port stored as htons — BPF C reads b->port directly into packet.
 
 type wlcEstVariant struct{ objs lb3Objects }
 
@@ -576,8 +576,8 @@ func (v *wlcEstVariant) Init(cfgPath string) error {
 		if err != nil {
 			return fmt.Errorf("backend[%d] IP: %w", i, err)
 		}
-		// wlc stores port RAW (no htons)
-		be := lb3Backend{Ip: ip, Port: b.Port, Conns: 0, Weight: defaultWeight(b.Weight)}
+		// wlc stores port as htons (same as lc)
+		be := lb3Backend{Ip: ip, Port: htons(b.Port), Conns: 0, Weight: defaultWeight(b.Weight)}
 		if err := v.objs.lb3Maps.Backends.Update(uint32(i), &be, ebpf.UpdateAny); err != nil {
 			return fmt.Errorf("update backends[%d]: %w", i, err)
 		}
@@ -600,7 +600,7 @@ func (v *wlcEstVariant) UpdateWeight(ip string, port, weight uint16) error {
 		if err := v.objs.lb3Maps.Backends.Lookup(i, &b); err != nil {
 			continue
 		}
-		if b.Ip == pip && b.Port == port {
+		if b.Ip == pip && b.Port == htons(port) {
 			b.Weight = weight
 			return v.objs.lb3Maps.Backends.Update(i, &b, ebpf.UpdateExist)
 		}
@@ -620,7 +620,7 @@ func (v *wlcEstVariant) AddBackend(ip string, port, weight uint16) error {
 		func(ip uint32, port, w uint16) interface{} {
 			return &lb3Backend{Ip: ip, Port: port, Conns: 0, Weight: w}
 		},
-		func(p uint16) uint16 { return p }) // RAW — no htons
+		htons)
 }
 
 func (v *wlcEstVariant) DeleteBackend(ip string, port uint16) error {
@@ -649,7 +649,7 @@ func (v *wlcEstVariant) DeleteBackend(ip string, port uint16) error {
 			return m.Update(dst, &b, ebpf.UpdateExist)
 		},
 		func() interface{} { return &lb3Backend{} },
-		func(p uint16) uint16 { return p }, // RAW — no htons
+		htons,
 		func(oldIdx, newIdx uint32) error {
 			return patchConntrackLb3(v.objs.lb3Maps.Conntrack, oldIdx, newIdx)
 		})
@@ -716,8 +716,8 @@ func (v *wlcSynVariant) Init(cfgPath string) error {
 		if err != nil {
 			return fmt.Errorf("backend[%d] IP: %w", i, err)
 		}
-		// wlc stores port RAW (no htons)
-		be := lb4Backend{Ip: ip, Port: b.Port, Conns: 0, Weight: defaultWeight(b.Weight)}
+		// wlc stores port as htons (same as lc)
+		be := lb4Backend{Ip: ip, Port: htons(b.Port), Conns: 0, Weight: defaultWeight(b.Weight)}
 		if err := v.objs.lb4Maps.Backends.Update(uint32(i), &be, ebpf.UpdateAny); err != nil {
 			return fmt.Errorf("update backends[%d]: %w", i, err)
 		}
@@ -740,7 +740,7 @@ func (v *wlcSynVariant) UpdateWeight(ip string, port, weight uint16) error {
 		if err := v.objs.lb4Maps.Backends.Lookup(i, &b); err != nil {
 			continue
 		}
-		if b.Ip == pip && b.Port == port {
+		if b.Ip == pip && b.Port == htons(port) {
 			b.Weight = weight
 			return v.objs.lb4Maps.Backends.Update(i, &b, ebpf.UpdateExist)
 		}
@@ -760,7 +760,7 @@ func (v *wlcSynVariant) AddBackend(ip string, port, weight uint16) error {
 		func(ip uint32, port, w uint16) interface{} {
 			return &lb4Backend{Ip: ip, Port: port, Conns: 0, Weight: w}
 		},
-		func(p uint16) uint16 { return p }) // RAW — no htons
+		htons)
 }
 
 func (v *wlcSynVariant) DeleteBackend(ip string, port uint16) error {
@@ -789,7 +789,7 @@ func (v *wlcSynVariant) DeleteBackend(ip string, port uint16) error {
 			return m.Update(dst, &b, ebpf.UpdateExist)
 		},
 		func() interface{} { return &lb4Backend{} },
-		func(p uint16) uint16 { return p }, // RAW — no htons
+		htons,
 		func(oldIdx, newIdx uint32) error {
 			return patchConntrackLb4(v.objs.lb4Maps.Conntrack, oldIdx, newIdx)
 		})
@@ -1052,7 +1052,7 @@ func (v *rrSynVariant) DeleteService(ip string, port uint16) error {
 }
 
 // ── WRR-EST variant (lb7 / lb_wrr_est.c) ─────────────────────────────────────
-// Same backend struct as wlc + UsedCount field. Port stored RAW (no htons).
+// Same backend struct as wlc + UsedCount field. Port stored as htons.
 
 type wrrEstVariant struct{ objs lb7Objects }
 
@@ -1097,8 +1097,8 @@ func (v *wrrEstVariant) Init(cfgPath string) error {
 		if err != nil {
 			return fmt.Errorf("backend[%d] IP: %w", i, err)
 		}
-		// wrr stores port RAW (no htons)
-		be := lb7Backend{Ip: ip, Port: b.Port, Conns: 0, Weight: defaultWeight(b.Weight), UsedCount: 0}
+		// wrr stores port as htons (same as lc)
+		be := lb7Backend{Ip: ip, Port: htons(b.Port), Conns: 0, Weight: defaultWeight(b.Weight), UsedCount: 0}
 		if err := v.objs.lb7Maps.Backends.Update(uint32(i), &be, ebpf.UpdateAny); err != nil {
 			return fmt.Errorf("update backends[%d]: %w", i, err)
 		}
@@ -1121,7 +1121,7 @@ func (v *wrrEstVariant) UpdateWeight(ip string, port, weight uint16) error {
 		if err := v.objs.lb7Maps.Backends.Lookup(i, &b); err != nil {
 			continue
 		}
-		if b.Ip == pip && b.Port == port {
+		if b.Ip == pip && b.Port == htons(port) {
 			b.Weight = weight
 			b.UsedCount = 0
 			return v.objs.lb7Maps.Backends.Update(i, &b, ebpf.UpdateExist)
@@ -1142,7 +1142,7 @@ func (v *wrrEstVariant) AddBackend(ip string, port, weight uint16) error {
 		func(ip uint32, port, w uint16) interface{} {
 			return &lb7Backend{Ip: ip, Port: port, Conns: 0, Weight: w, UsedCount: 0}
 		},
-		func(p uint16) uint16 { return p }) // RAW — no htons
+		htons)
 }
 
 func (v *wrrEstVariant) DeleteBackend(ip string, port uint16) error {
@@ -1171,7 +1171,7 @@ func (v *wrrEstVariant) DeleteBackend(ip string, port uint16) error {
 			return m.Update(dst, &b, ebpf.UpdateExist)
 		},
 		func() interface{} { return &lb7Backend{} },
-		func(p uint16) uint16 { return p }, // RAW — no htons
+		htons,
 		func(oldIdx, newIdx uint32) error {
 			return patchConntrackLb7(v.objs.lb7Maps.Conntrack, oldIdx, newIdx)
 		})
@@ -1241,8 +1241,8 @@ func (v *wrrSynVariant) Init(cfgPath string) error {
 		if err != nil {
 			return fmt.Errorf("backend[%d] IP: %w", i, err)
 		}
-		// wrr stores port RAW (no htons)
-		be := lb8Backend{Ip: ip, Port: b.Port, Conns: 0, Weight: defaultWeight(b.Weight), UsedCount: 0}
+		// wrr stores port as htons (same as lc)
+		be := lb8Backend{Ip: ip, Port: htons(b.Port), Conns: 0, Weight: defaultWeight(b.Weight), UsedCount: 0}
 		if err := v.objs.lb8Maps.Backends.Update(uint32(i), &be, ebpf.UpdateAny); err != nil {
 			return fmt.Errorf("update backends[%d]: %w", i, err)
 		}
@@ -1265,7 +1265,7 @@ func (v *wrrSynVariant) UpdateWeight(ip string, port, weight uint16) error {
 		if err := v.objs.lb8Maps.Backends.Lookup(i, &b); err != nil {
 			continue
 		}
-		if b.Ip == pip && b.Port == port {
+		if b.Ip == pip && b.Port == htons(port) {
 			b.Weight = weight
 			b.UsedCount = 0
 			return v.objs.lb8Maps.Backends.Update(i, &b, ebpf.UpdateExist)
@@ -1286,7 +1286,7 @@ func (v *wrrSynVariant) AddBackend(ip string, port, weight uint16) error {
 		func(ip uint32, port, w uint16) interface{} {
 			return &lb8Backend{Ip: ip, Port: port, Conns: 0, Weight: w, UsedCount: 0}
 		},
-		func(p uint16) uint16 { return p }) // RAW — no htons
+		htons)
 }
 
 func (v *wrrSynVariant) DeleteBackend(ip string, port uint16) error {
@@ -1315,7 +1315,7 @@ func (v *wrrSynVariant) DeleteBackend(ip string, port uint16) error {
 			return m.Update(dst, &b, ebpf.UpdateExist)
 		},
 		func() interface{} { return &lb8Backend{} },
-		func(p uint16) uint16 { return p }, // RAW — no htons
+		htons,
 		func(oldIdx, newIdx uint32) error {
 			return patchConntrackLb8(v.objs.lb8Maps.Conntrack, oldIdx, newIdx)
 		})

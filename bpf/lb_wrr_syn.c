@@ -435,16 +435,16 @@ int xdp_load_balancer(struct xdp_md *ctx)
         return XDP_ABORTED;
       }
 
-      b->used_count += 1; //Increment used_count as we are adding a new connection to this backend
+      b->used_count += 1; // Increment used_count as we are adding a new connection to this backend
 
-      //Only after using this backend in accordance to its weight will the following if-statement be fulfilled
-      if (b->used_count >= b->weight) //Check whether used_count is equal to the backend's weight
+      // Only after using this backend in accordance to its weight will the following if-statement be fulfilled
+      if (b->used_count >= b->weight) // Check whether used_count is equal to the backend's weight
       {
-        b->used_count = 0; //Set used_count to 0 when it completes its weight
-        __u32 next_idx = (key + 1) % *num_backends; //Increment the index to point to the next backend
-        bpf_map_update_elem(&scheduler_state, &zero, &next_idx, BPF_ANY);  //Update index in scheduler_state map
+        b->used_count = 0;                                                // Set used_count to 0 when it completes its weight
+        __u32 next_idx = (key + 1) % *num_backends;                       // Increment the index to point to the next backend
+        bpf_map_update_elem(&scheduler_state, &zero, &next_idx, BPF_ANY); // Update index in scheduler_state map
       }
-      
+
       // Increment connection counter for the backend
       struct backend nb = *b;
       nb.conns += 1;

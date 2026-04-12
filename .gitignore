@@ -2,6 +2,7 @@
 *.out
 *_bpf.go
 cmd/lb/lb*_bpf.go
+*.o
 
 # Generated eBPF Go bindings
 *_bpf.go

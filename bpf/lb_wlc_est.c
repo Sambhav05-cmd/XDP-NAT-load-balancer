@@ -402,7 +402,6 @@ int xdp_load_balancer(struct xdp_md *ctx)
         // bpf_printk("ABORT_1 no_ct_entry_non_syn");
         return XDP_ABORTED;
       }
-      // bpf_printk("yessss");
 
       __u32 key = 0;
       __u32 min_conn = (__u32)-1;

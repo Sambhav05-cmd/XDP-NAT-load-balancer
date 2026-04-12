@@ -4,6 +4,8 @@ A high-performance Layer-4 NAT based load balancer built in the XDP/eBPF fast pa
 
 The dataplane performs connection tracking, backend selection, and bidirectional address rewriting entirely before packets enter the Linux networking stack, enabling low-latency and high-throughput load distribution under heavy connection concurrency.
 
+> Benchmarked against Linux IPVS, the XDP dataplane achieves **~19× lower average forwarding latency** — and the true advantage is larger still, as the measurement excludes skb allocation, GRO, and netfilter/conntrack overhead that IPVS pays but XDP bypasses entirely.
+
 The system supports Least-Connections (LC), Weighted Least-Connections (WLC), Round-Robin (RR), and Weighted Round-Robin (WRR) scheduling, each available with selectable connection accounting modes. It is structured as a long-running daemon that loads and owns the BPF program, and a separate control CLI that communicates with the daemon at runtime — without ever restarting the dataplane.
 
 Traffic is steered only for configured services, allowing unrelated network flows to pass through the interface unaffected.
@@ -18,6 +20,7 @@ Traffic is steered only for configured services, allowing unrelated network flow
 - [Key Capabilities](#key-capabilities)
 - [Scheduling Algorithm Comparison](#scheduling-algorithm-comparison)
 - [Suitable Deployment Scenarios](#suitable-deployment-scenarios)
+- [Flow Diagrams](#flow-diagrams)
 - [Scheduling Algorithms](#scheduling-algorithms)
 - [Connection Tracking Modes](#connection-tracking-modes)
 - [Repository Structure](#repository-structure)
@@ -26,7 +29,8 @@ Traffic is steered only for configured services, allowing unrelated network flow
 - [Building](#building)
 - [Running](#running)
 - [Runtime CLI](#runtime-cli)
-- [Testing](#testing)
+- [Latency Benchmarking](#latency-benchmarking)
+- [Testing Workload](#testing-workload)
 - [Customization](#customization)
 - [References](#references)
 
@@ -116,6 +120,13 @@ This project implements four stateful alternatives, each trading a small amount 
 - **High concurrent connection environments** — XDP fast-path processing keeps per-packet overhead low even with stateful scheduling.
 - **Short-lived, uniform workloads** — RR and WRR offer a lightweight alternative to hashing with fairer rotation semantics.
 
+---
+## Flow Diagrams
+![p1](./images/p1.png)
+
+![p2](./images/p2.png)
+
+![p3](./images/p3.png)
 ---
 
 ## Scheduling Algorithms
@@ -288,15 +299,15 @@ sudo ./bin/lbxdpd -i eth0 -algo wlc -mode est -config configs/backends_wlc.json
 ### Round Robin (RR)
 
 ```bash
-sudo ./bin/lbxdpd -i eth0 -algo rr -mode syn -config configs/backends_rr.json
-sudo ./bin/lbxdpd -i eth0 -algo rr -mode est -config configs/backends_rr.json
+sudo ./bin/lbxdpd -i eth0 -algo rr -mode syn -config configs/backends_lc.json
+sudo ./bin/lbxdpd -i eth0 -algo rr -mode est -config configs/backends_lc.json
 ```
 
 ### Weighted Round Robin (WRR)
 
 ```bash
-sudo ./bin/lbxdpd -i eth0 -algo wrr -mode syn -config configs/backends_wrr.json
-sudo ./bin/lbxdpd -i eth0 -algo wrr -mode est -config configs/backends_wrr.json
+sudo ./bin/lbxdpd -i eth0 -algo wrr -mode syn -config configs/backends_wlc.json
+sudo ./bin/lbxdpd -i eth0 -algo wrr -mode est -config configs/backends_wlc.json
 ```
 
 Replace `eth0` with the interface you want to attach to (e.g. `wlo1`, `ens3`).
@@ -356,7 +367,33 @@ Once the daemon is running, use `lbctl` in a separate terminal.
 
 ---
 
-## Testing
+## Latency Benchmarking
+
+The XDP dataplane was benchmarked against Linux IPVS under identical traffic conditions, both xdp and ipvs used round robin in NAT mode.
+
+**XDP** was measured using `bpf_ktime_get_ns()` at program entry and exit. **IPVS** was measured using `ftrace` function_graph with `ip_vs_in_hook` as root, counting only packets where `ip_vs_nat_xmit` was called (genuine forwarded packets only).
+
+Traffic was generated from a client using:
+
+```bash
+for i in $(seq 1 100); do
+  curl -o /dev/null -s -w "%{time_connect}\n" http://<VIP>:8080
+  sleep 0.3
+done
+```
+
+![Latency Comparison](./images/ipvs_vs_xdp.png)
+
+| | Min (µs) | Max (µs) | Avg (µs) |
+|---|---|---|---|
+| **XDP** | 1.43 | 36.79 | 14.62 |
+| **IPVS** | 38.35 | 683.23 | 281.37 |
+
+XDP achieves roughly **19× lower average latency** than IPVS at the forwarding-decision boundary. Note that the IPVS measurement starts at `ip_vs_in_hook` and excludes the preceding skb allocation, GRO, and netfilter/conntrack overhead that IPVS pays but XDP bypasses entirely — meaning the true end-to-end advantage is even larger.
+
+---
+
+## Testing Workload
 
 To test connection tracking, connections need to persist for some time. The `socat` tool is ideal for this — it keeps connections alive without sending large amounts of data.
 

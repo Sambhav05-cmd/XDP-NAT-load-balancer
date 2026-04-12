@@ -299,7 +299,7 @@ int xdp_load_balancer(struct xdp_md *ctx)
   if (ct)
   {
     // packet arrived from backend, conntrack entry exists
-    bpf_printk("Packet from backend %pI4 , %d, conn state=%d", &ip->saddr, bpf_ntohs(tcp->dest), ct->state);
+    // bpf_printk("Packet from backend %pI4 , %d, conn state=%d", &ip->saddr, bpf_ntohs(tcp->dest), ct->state);
     ct_port = ct->port;
     ct_service_port = ct->service_port;
     ct_ip = ct->ip;
@@ -351,8 +351,8 @@ int xdp_load_balancer(struct xdp_md *ctx)
       // Delete conntrack entry
       bpf_map_delete_elem(&conntrack, &ct_key_from_backend);
 
-      bpf_printk("connection deleted. (Backend path) Backend %pI4 conns=%d",
-                 &b->ip, nb.conns);
+      // bpf_printk("connection deleted. (Backend path) Backend %pI4 conns=%d",
+      //            &b->ip, nb.conns);
     }
 
     // FIB lookup: send reply toward the client
@@ -373,7 +373,7 @@ int xdp_load_balancer(struct xdp_md *ctx)
   }
   else
   { // packet from client, check if service exists for the VIP and port
-    bpf_printk("Packet from client %pI4:%d, dest port %d", &ip->saddr, bpf_ntohs(tcp->source), bpf_ntohs(tcp->dest));
+    // bpf_printk("Packet from client %pI4:%d, dest port %d", &ip->saddr, bpf_ntohs(tcp->source), bpf_ntohs(tcp->dest));
     struct ip_port svc_key = {};
     svc_key.ip = ip->daddr;
     svc_key.port = tcp->dest;
@@ -399,10 +399,10 @@ int xdp_load_balancer(struct xdp_md *ctx)
       //  new connection, need to select backend and translate port if (tcp->syn == 0)
       if (tcp->syn == 0)
       {
-        bpf_printk("ABORT_1 no_ct_entry_non_syn");
+        // bpf_printk("ABORT_1 no_ct_entry_non_syn");
         return XDP_ABORTED;
       }
-      bpf_printk("yessss");
+      // bpf_printk("yessss");
 
       __u32 key = 0;
       __u32 min_conn = (__u32)-1;
@@ -454,7 +454,7 @@ int xdp_load_balancer(struct xdp_md *ctx)
       b = bpf_map_lookup_elem(&backends, &key);
       if (!b)
       {
-        bpf_printk("ABORT_3 selected_backend_lookup_failed");
+        // bpf_printk("ABORT_3 selected_backend_lookup_failed");
         return XDP_ABORTED;
       }
       // find available port for translation and insert into port_ownership map
@@ -462,7 +462,7 @@ int xdp_load_balancer(struct xdp_md *ctx)
       long ret = bpf_map_pop_elem(&free_ports, &p);
       if (ret < 0)
       {
-        bpf_printk("NO_FREE_PORT");
+        // bpf_printk("NO_FREE_PORT");
         return XDP_ABORTED;
       }
 
@@ -481,17 +481,17 @@ int xdp_load_balancer(struct xdp_md *ctx)
       // Insert conntrack entry for the new connection
       if (bpf_map_update_elem(&conntrack, &ct_key, &meta, BPF_ANY) != 0)
       {
-        bpf_printk("ABORT_4 conntrack_insert_failed");
+        // bpf_printk("ABORT_4 conntrack_insert_failed");
         return XDP_ABORTED;
       }
       // Insert port_ownership entry to link client-facing five-tuple to conntrack entry
       if (bpf_map_update_elem(&port_ownership, &po_key, &ct_key, BPF_ANY) != 0)
       {
-        bpf_printk("ABORT_5 port_ownership_insert_failed");
+        // bpf_printk("ABORT_5 port_ownership_insert_failed");
         return XDP_ABORTED;
       }
-      bpf_printk("New connection: Client %pI4:%d -> Backend %pI4",
-                 &ip->saddr, bpf_ntohs(tcp->source), &b->ip);
+      // bpf_printk("New connection: Client %pI4:%d -> Backend %pI4",
+      //            &ip->saddr, bpf_ntohs(tcp->source), &b->ip);
     }
     else
     { // existing connection, look up backend and port translation info for forwarding
@@ -515,8 +515,8 @@ int xdp_load_balancer(struct xdp_md *ctx)
         struct backend nb = *b;
         nb.conns += 1;
         bpf_map_update_elem(&backends, &ct->backend_idx, &nb, BPF_ANY);
-        bpf_printk("conn established : Backend %pI4 conns=%d",
-                   &b->ip, nb.conns);
+        // bpf_printk("conn established : Backend %pI4 conns=%d",
+        //&b->ip, nb.conns);
         ct = bpf_map_lookup_elem(&conntrack, &ct_key);
         if (!ct)
           return XDP_ABORTED;
@@ -556,8 +556,8 @@ int xdp_load_balancer(struct xdp_md *ctx)
         bpf_map_delete_elem(&conntrack, &ct_key);
         bpf_map_delete_elem(&port_ownership, &po_key);
 
-        bpf_printk("conn deleted (client path). Backend %pI4 conns=%d",
-                   &b->ip, nb.conns);
+        // bpf_printk("conn deleted (client path). Backend %pI4 conns=%d",
+        //&b->ip, nb.conns);
       }
     }
 

@@ -114,13 +114,6 @@ struct
 // Per-CPU ingress timestamp — written at XDP entry before any processing.
 // Key 0 = ingress timestamp in nanoseconds.
 // Read by bpftrace at POSTROUTING to compute end-to-end latency.
-struct
-{
-  __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
-  __uint(max_entries, 1);
-  __type(key, __u32);
-  __type(value, __u64);
-} ts_map SEC(".maps");
 
 // helpers
 
@@ -266,10 +259,6 @@ static __always_inline int fib_lookup_v4_full(struct xdp_md *ctx,
 SEC("xdp")
 int xdp_load_balancer(struct xdp_md *ctx)
 {
-  // Record ingress timestamp immediately — before any processing or SKB allocation.
-  __u64 ingress_ts = bpf_ktime_get_ns();
-  __u32 ts_key = 0;
-  bpf_map_update_elem(&ts_map, &ts_key, &ingress_ts, BPF_ANY);
 
   void *data_end = (void *)(long)ctx->data_end;
   void *data = (void *)(long)ctx->data;
@@ -298,12 +287,13 @@ int xdp_load_balancer(struct xdp_md *ctx)
     return XDP_PASS;
 
   // bpf_printk("IN: SRC IP %pI4 src port %d dest port %d", &ip->saddr, bpf_ntohs(tcp->source), bpf_ntohs(tcp->dest));
-  /*//bpf_printk("IN: SRC MAC %02x:%02x:%02x:%02x:%02x:%02x -> DST MAC "
-             "%02x:%02x:%02x:%02x:%02x:%02x",
-             eth->h_source[0], eth->h_source[1], eth->h_source[2],
-             eth->h_source[3], eth->h_source[4], eth->h_source[5],
-             eth->h_dest[0], eth->h_dest[1], eth->h_dest[2], eth->h_dest[3],
-             eth->h_dest[4], eth->h_dest[5]);*/
+  /*/ / bpf_printk("IN: SRC MAC %02x:%02x:%02x:%02x:%02x:%02x -> DST MAC "
+                   "%02x:%02x:%02x:%02x:%02x:%02x",
+                   eth->h_source[0], eth->h_source[1], eth->h_source[2],
+                   eth->h_source[3], eth->h_source[4], eth->h_source[5],
+                   eth->h_dest[0], eth->h_dest[1], eth->h_dest[2], eth->h_dest[3],
+                   eth->h_dest[4], eth->h_dest[5]);
+  */
 
   // store Load Balancer IP for later
   __u32 lb_ip = ip->daddr;
@@ -592,14 +582,6 @@ int xdp_load_balancer(struct xdp_md *ctx)
   //bpf_printk("OUT DST MAC %02x:%02x", eth->h_dest[0], eth->h_dest[1]);
   //bpf_printk("OUT DST MAC %02x:%02x", eth->h_dest[2], eth->h_dest[3]);
   //bpf_printk("OUT DST MAC %02x:%02x", eth->h_dest[4], eth->h_dest[5]);*/
-  ts_key = 0;
-  __u64 *start = bpf_map_lookup_elem(&ts_map, &ts_key);
-  if (start)
-  {
-    __u64 end = bpf_ktime_get_ns();
-    __u64 delta = end - *start;
-    bpf_printk("XDP total time: %llu ns", delta);
-  }
   return XDP_TX;
 }
 

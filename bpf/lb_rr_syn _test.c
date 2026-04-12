@@ -71,6 +71,15 @@ struct
   __type(value, __u32);
 } backend_count SEC(".maps");
 
+// Holds the next backend_idx to be used
+struct
+{
+  __uint(type, BPF_MAP_TYPE_ARRAY);
+  __uint(max_entries, 1);
+  __type(key, __u32);
+  __type(value, __u32);
+} scheduler_state SEC(".maps");
+
 // conntrack: keyed by (LB-side five-tuple as seen FROM the backend)
 //   src_ip   = LB IP
 //   dst_ip   = backend IP
@@ -101,6 +110,17 @@ struct
   __uint(max_entries, MAX_PORT);
   __type(value, __u16);
 } free_ports SEC(".maps");
+
+// Per-CPU ingress timestamp — written at XDP entry before any processing.
+// Key 0 = ingress timestamp in nanoseconds.
+// Read by bpftrace at POSTROUTING to compute end-to-end latency.
+struct
+{
+  __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+  __uint(max_entries, 1);
+  __type(key, __u32);
+  __type(value, __u64);
+} ts_map SEC(".maps");
 
 // helpers
 
@@ -142,7 +162,7 @@ static __always_inline void log_fib_error(int rc)
     break;
   case BPF_FIB_LKUP_RET_NO_SRC_ADDR:
     bpf_printk(
-        "FIB lookup failed: NO SOURCE ADDRESS. Kernel couldn’t choose a source "
+        "FIB lookup failed: NO SOURCE ADDRESS. Kernel couldn't choose a source "
         "IP – ensure the interface has an IP in the correct subnet.");
     break;
   default:
@@ -161,7 +181,7 @@ static __always_inline __u16 recalc_ip_checksum(struct iphdr *ip)
   // Compute incremental checksum difference over the header
   __u64 csum = bpf_csum_diff(0, 0, (unsigned int *)ip, sizeof(struct iphdr), 0);
 
-// fold 64-bit csum to 16 bits (the “carry add” loop)
+// fold 64-bit csum to 16 bits (the "carry add" loop)
 #pragma unroll
   for (int i = 0; i < 4; i++)
   {
@@ -246,6 +266,11 @@ static __always_inline int fib_lookup_v4_full(struct xdp_md *ctx,
 SEC("xdp")
 int xdp_load_balancer(struct xdp_md *ctx)
 {
+  // Record ingress timestamp immediately — before any processing or SKB allocation.
+  __u64 ingress_ts = bpf_ktime_get_ns();
+  __u32 ts_key = 0;
+  bpf_map_update_elem(&ts_map, &ts_key, &ingress_ts, BPF_ANY);
+
   void *data_end = (void *)(long)ctx->data_end;
   void *data = (void *)(long)ctx->data;
 
@@ -273,12 +298,13 @@ int xdp_load_balancer(struct xdp_md *ctx)
     return XDP_PASS;
 
   // bpf_printk("IN: SRC IP %pI4 src port %d dest port %d", &ip->saddr, bpf_ntohs(tcp->source), bpf_ntohs(tcp->dest));
-  /*//bpf_printk("IN: SRC MAC %02x:%02x:%02x:%02x:%02x:%02x -> DST MAC "
-             "%02x:%02x:%02x:%02x:%02x:%02x",
-             eth->h_source[0], eth->h_source[1], eth->h_source[2],
-             eth->h_source[3], eth->h_source[4], eth->h_source[5],
-             eth->h_dest[0], eth->h_dest[1], eth->h_dest[2], eth->h_dest[3],
-             eth->h_dest[4], eth->h_dest[5]);*/
+  /*/ / bpf_printk("IN: SRC MAC %02x:%02x:%02x:%02x:%02x:%02x -> DST MAC "
+                   "%02x:%02x:%02x:%02x:%02x:%02x",
+                   eth->h_source[0], eth->h_source[1], eth->h_source[2],
+                   eth->h_source[3], eth->h_source[4], eth->h_source[5],
+                   eth->h_dest[0], eth->h_dest[1], eth->h_dest[2], eth->h_dest[3],
+                   eth->h_dest[4], eth->h_dest[5]);
+  */
 
   // store Load Balancer IP for later
   __u32 lb_ip = ip->daddr;
@@ -350,8 +376,9 @@ int xdp_load_balancer(struct xdp_md *ctx)
       // Delete conntrack entry
       bpf_map_delete_elem(&conntrack, &ct_key_from_backend);
 
-      // bpf_printk("connection deleted. (Backend path) Backend %pI4 conns=%d",
-      //&b->ip, nb.conns);
+      /*bpf_printk("connection deleted. (Backend path) Backend %pI4 conns=%d",
+                 &b->ip, nb.conns)*/
+      ;
     }
 
     // FIB lookup: send reply toward the client
@@ -403,30 +430,18 @@ int xdp_load_balancer(struct xdp_md *ctx)
       }
 
       __u32 key = 0;
-      __u32 min_conn = (__u32)-1;
-
       __u32 zero = 0;
       __u32 *num_backends = bpf_map_lookup_elem(&backend_count, &zero);
       if (!num_backends)
+        return XDP_ABORTED;
+
+      __u32 *curr_idx = bpf_map_lookup_elem(&scheduler_state, &zero);
+      if (!curr_idx)
       {
-        // bpf_printk("ABORT_2 backend_count_lookup_failed");
         return XDP_ABORTED;
       }
 
-      for (__u32 i = 0; i < MAX_BACKENDS; i++)
-      {
-        if (i >= *num_backends)
-        {
-          break;
-        }
-        __u32 k = i;
-        struct backend *cand = bpf_map_lookup_elem(&backends, &k);
-        if (cand && cand->conns < min_conn)
-        {
-          min_conn = cand->conns;
-          key = k;
-        }
-      }
+      key = *curr_idx;
 
       b = bpf_map_lookup_elem(&backends, &key);
       if (!b)
@@ -434,6 +449,9 @@ int xdp_load_balancer(struct xdp_md *ctx)
         // bpf_printk("ABORT_3 selected_backend_lookup_failed");
         return XDP_ABORTED;
       }
+
+      __u32 next_idx = (key + 1) % *num_backends;                       // Increment the index to point to the next backend
+      bpf_map_update_elem(&scheduler_state, &zero, &next_idx, BPF_ANY); // Update index in scheduler_state map
 
       // find available port for translation and insert into port_ownership map
       __u16 p;
@@ -474,7 +492,7 @@ int xdp_load_balancer(struct xdp_md *ctx)
       bpf_map_update_elem(&backends, &key, &nb, BPF_ANY);
 
       // bpf_printk("New connection: Client %pI4:%d -> Backend %pI4",
-      //&ip->saddr, bpf_ntohs(tcp->source), &b->ip);
+      //            &ip->saddr, bpf_ntohs(tcp->source), &b->ip);
     }
     else
     {
@@ -574,7 +592,14 @@ int xdp_load_balancer(struct xdp_md *ctx)
   //bpf_printk("OUT DST MAC %02x:%02x", eth->h_dest[0], eth->h_dest[1]);
   //bpf_printk("OUT DST MAC %02x:%02x", eth->h_dest[2], eth->h_dest[3]);
   //bpf_printk("OUT DST MAC %02x:%02x", eth->h_dest[4], eth->h_dest[5]);*/
-
+  ts_key = 0;
+  __u64 *start = bpf_map_lookup_elem(&ts_map, &ts_key);
+  if (start)
+  {
+    __u64 end = bpf_ktime_get_ns();
+    __u64 delta = end - *start;
+    bpf_printk("XDP total time: %llu ns", delta);
+  }
   return XDP_TX;
 }
 

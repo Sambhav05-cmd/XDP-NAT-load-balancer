@@ -1,8 +1,6 @@
 /bin
 *.out
-lb_lc_*
-lb_lwc_*
-lb_wlc_*
+*_bpf.go
 cmd/lb/lb*_bpf.go
 
 # Generated eBPF Go bindings

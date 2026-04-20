@@ -362,7 +362,7 @@ int xdp_load_balancer(struct xdp_md *ctx)
       bpf_map_delete_elem(&conntrack, &ct_key_from_backend);
 
       //  bpf_printk("connection deleted. (Backend path) Backend %pI4 conns=%d",
-                 &b->ip, nb.conns);
+                 //&b->ip, nb.conns);
     }
 
     // FIB lookup: send reply toward the client
@@ -505,7 +505,7 @@ int xdp_load_balancer(struct xdp_md *ctx)
         bpf_map_update_elem(&conntrack, &ct_key, &updated, BPF_ANY);
 
         //  bpf_printk("conn established : Backend %pI4 conns=%d",
-                   &b->ip, &b->conns);
+                   //&b->ip, &b->conns);
                    ct = bpf_map_lookup_elem(&conntrack, &ct_key);
                    if (!ct)
                      return XDP_ABORTED;
@@ -546,7 +546,7 @@ int xdp_load_balancer(struct xdp_md *ctx)
         bpf_map_delete_elem(&port_ownership, &po_key);
 
         //  bpf_printk("conn deleted (client path). Backend %pI4 conns=%d",
-                   &b->ip, nb.conns);
+                   //&b->ip, nb.conns);
       }
     }
 
